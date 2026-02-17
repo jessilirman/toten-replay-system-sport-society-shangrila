@@ -1,179 +1,76 @@
-const express = require('express');
-const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
-const axios = require('axios');
-const FormData = require('form-data');
+import evdev
+import requests
+import threading
+import time
+import os
+import datetime
+import sys
 
-// --- CONFIGURAÇÕES ---
-const PORTA = 3000;
-const VPS_URL = 'http://93.127.212.187:3000/api/upload-video'; 
-const API_KEY_VPS = 'maciel_secure_upload_key_2024';
+# --- CONFIGURAÇÃO ---
+# Aponta para o Node.js que roda no mesmo notebook
+URL_API_LOCAL = 'http://localhost:3000/api/record'
+LOG_FILE = '/opt/replay-system/registro_botoes.log'
 
-const GRAVACAO_DIR = path.join(__dirname, 'buffer_cameras');
-const OUTPUT_DIR = path.join(__dirname, 'saida_videos');
-
-// Configuração do DVR
-const DVR = {
-    ip: '10.1.1.41', porta: '554', user: 'admin', pass: 'ptlm4030jx', subtype: '0'
-};
-const CANAIS = [9, 13];
-
-// --- INICIALIZAÇÃO ---
-if (!fs.existsSync(GRAVACAO_DIR)) fs.mkdirSync(GRAVACAO_DIR, { recursive: true });
-if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-// --- 1. LÓGICA DE GRAVAÇÃO (BUFFER OTIMIZADO) ---
-function iniciarGravacao(canal) {
-    const pastaCam = path.join(GRAVACAO_DIR, `cam${canal}`);
-    if (!fs.existsSync(pastaCam)) fs.mkdirSync(pastaCam);
-
-    const rtspUrl = `rtsp://${DVR.user}:${DVR.pass}@${DVR.ip}:${DVR.porta}/cam/realmonitor?channel=${canal}&subtype=${DVR.subtype}`;
-
-    console.log(`🎥 [CAM ${canal}] Gravando: Blocos de 45s (Mantendo últimos 4)...`);
-    const ffmpeg = spawn('ffmpeg', [
-        '-rtsp_transport', 'tcp',
-        '-i', rtspUrl,
-        '-c', 'copy',
-        '-f', 'segment',
-        '-segment_time', '45',
-        '-segment_wrap', '4',
-        '-reset_timestamps', '1',
-        '-y', path.join(pastaCam, 'chunk_%03d.ts')
-    ]);
-
-    ffmpeg.stderr.on('data', () => {});
-    ffmpeg.on('close', (code) => {
-        console.log(`⚠️ [CAM ${canal}] Caiu (Código ${code}). Reiniciando em 2s...`);
-        setTimeout(() => iniciarGravacao(canal), 2000);
-    });
+# Mapeamento Serial -> Câmera
+MAPA_SERIAIS = {
+    'BE104C63': 9,   # Câmera Fundo
+    'BE10448F': 13   # Câmera Bar
 }
 
-// --- 2. LÓGICA DE CORTE (REPLAY) ---
-async function processarEvento(camId) {
-    const timestamp = Date.now();
-    const nomeArquivo = `replay_cam${camId}_${timestamp}.mp4`;
-    const pastaCam = path.join(GRAVACAO_DIR, `cam${camId}`);
-    const arquivoFinal = path.join(OUTPUT_DIR, nomeArquivo);
-    const listaTxt = path.join(pastaCam, `list_${timestamp}.txt`);
+def log(msg):
+    ts = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    texto = f"[{ts}] {msg}"
+    print(texto)
+    sys.stdout.flush()
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(texto + "\n")
+    except:
+        pass
 
-    console.log(`🎬 [CAM ${camId}] Botão acionado! Gerando replay...`);
+def acionar_camera(cam):
+    log(f"🔘 BOTÃO APERTADO! Câmera {cam}")
+    try:
+        # Envia o JSON exigido pelo Node
+        r = requests.post(URL_API_LOCAL, json={'cam': str(cam)}, timeout=3)
+        if r.status_code == 200:
+            log(f"   ✅ Sucesso: Node.js iniciou corte.")
+        elif r.status_code == 429:
+            log(f"   🛡️ Ignorado: Spam protection ativo.")
+        else:
+            log(f"   ⚠️ Erro Node: {r.status_code}")
+    except Exception as e:
+        log(f"   ❌ Erro Conexão Local: {e}")
 
-    try {
-        const arquivos = fs.readdirSync(pastaCam)
-            .filter(f => f.endsWith('.ts'))
-            .map(f => ({ nome: f, caminho: path.join(pastaCam, f), mtime: fs.statSync(path.join(pastaCam, f)).mtimeMs }))
-            .sort((a, b) => b.mtime - a.mtime);
+def monitorar_device(path, cam):
+    log(f"🔌 Monitorando Hardware: {path} (CAM {cam})")
+    try:
+        device = evdev.InputDevice(path)
+        for event in device.read_loop():
+            # Detecta o clique da tecla
+            if event.type == evdev.ecodes.EV_KEY and event.value == 1:
+                threading.Thread(target=acionar_camera, args=(cam,)).start()
+    except Exception as e:
+        log(f"💀 Dispositivo {cam} desconectado: {e}")
 
-        const chunksParaUso = arquivos.slice(0, 3).reverse();
-        if (chunksParaUso.length === 0) throw new Error("Sem gravações disponíveis ainda.");
+def main():
+    log("🚀 INICIANDO MONITOR DE BOTÕES")
+    threads = {}
 
-        const conteudoLista = chunksParaUso.map(c => `file '${c.caminho}'`).join('\n');
-        fs.writeFileSync(listaTxt, conteudoLista);
-
-        await new Promise((resolve, reject) => {
-            const cut = spawn('ffmpeg', [
-                '-f', 'concat', '-safe', '0', '-i', listaTxt,
-                '-sseof', '-30',
-                '-t', '30',
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-y', arquivoFinal
-            ]);
-            cut.on('close', code => code === 0 ? resolve() : reject('Erro no corte FFmpeg'));
-        });
-
-        console.log(`✅ [CAM ${camId}] Vídeo criado e adicionado à fila: ${nomeArquivo}`);
-        fs.unlinkSync(listaTxt); 
+    while True:
+        if os.path.exists('/dev/input/by-id/'):
+            arquivos = os.listdir('/dev/input/by-id/')
+            for arquivo in arquivos:
+                full_path = os.path.join('/dev/input/by-id/', arquivo)
+                for serial, cam in MAPA_SERIAIS.items():
+                    if serial in arquivo and 'event-kbd' in arquivo:
+                        if cam not in threads or not threads[cam].is_alive():
+                            t = threading.Thread(target=monitorar_device, args=(full_path, cam), daemon=True)
+                            t.start()
+                            threads[cam] = t
         
-        // AQUI MUDOU: Não envia para a VPS imediatamente. Apenas salva na pasta.
-        // O sistema de Fila (abaixo) cuidará do envio.
+        # Intervalo de 5s evita uso excessivo de CPU
+        time.sleep(5)
 
-    } catch (error) {
-        console.error(`❌ [CAM ${camId}] Erro: ${error.message}`);
-    }
-}
-
-// --- 3. SISTEMA DE FILA E UPLOAD (PROTEÇÃO CONTRA QUEDA DE INTERNET) ---
-let enviando = false;
-
-async function processarFila() {
-    if (enviando) return; // Evita enviar duas coisas ao mesmo tempo
-    
-    try {
-        const arquivos = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.mp4'));
-        if (arquivos.length === 0) return; // Fila vazia
-
-        enviando = true;
-        console.log(`🔄 Fila de Upload: ${arquivos.length} vídeo(s) aguardando...`);
-
-        for (const arquivo of arquivos) {
-            const caminhoArquivo = path.join(OUTPUT_DIR, arquivo);
-            
-            // Extrai qual câmera gravou isso com base no nome do arquivo (ex: replay_cam9_123.mp4 -> 9)
-            const match = arquivo.match(/cam(\d+)_/);
-            const camId = match ? match[1] : '0';
-
-            console.log(`☁️ Tentando enviar ${arquivo}...`);
-            
-            const form = new FormData();
-            form.append('video', fs.createReadStream(caminhoArquivo));
-            form.append('camId', camId);
-            form.append('secret', API_KEY_VPS);
-
-            // Tenta enviar. Se a internet estiver caída, vai dar erro e cair no catch
-            const response = await axios.post(VPS_URL, form, {
-                headers: { ...form.getHeaders() },
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity
-            });
-
-            console.log(`🚀 Upload Sucesso! VPS respondeu: ${response.data.message}`);
-            
-            // APAGA do Totem SÓ DEPOIS QUE A VPS CONFIRMAR QUE RECEBEU!
-            if (fs.existsSync(caminhoArquivo)) fs.unlinkSync(caminhoArquivo);
-        }
-    } catch (error) {
-        console.error(`❌ Falha no Upload (Sem internet?): ${error.message}`);
-        console.log("⏳ O vídeo continuará na fila e o sistema tentará novamente em 30 segundos.");
-    } finally {
-        enviando = false;
-    }
-}
-
-// Inicia o verificador da fila a cada 30 segundos
-setInterval(processarFila, 30000);
-
-
-// --- 4. API LOCAL ---
-const app = express();
-app.use(cors());
-app.use(express.json()); 
-
-const ultimoClique = {};
-
-app.post('/api/record', (req, res) => {
-    if (!req.body || !req.body.cam) {
-        return res.status(400).json({ error: 'Parâmetro "cam" obrigatório' });
-    }
-
-    const { cam } = req.body;
-    const agora = Date.now();
-
-    if (ultimoClique[cam] && (agora - ultimoClique[cam] < 15000)) {
-        console.log(`🛡️ [CAM ${cam}] Spam bloqueado.`);
-        return res.status(429).json({ error: 'Aguarde...' });
-    }
-
-    ultimoClique[cam] = agora;
-    processarEvento(cam);
-    res.json({ status: 'Processando localmente e adicionado à fila...' });
-});
-
-app.listen(PORTA, () => {
-    console.log(`🔥 SERVER TOTEM (Node) | Porta ${PORTA}`);
-    console.log(`📹 Config: Segmentos de 45s | Proteção de Internet ATIVADA`);
-    CANAIS.forEach(iniciarGravacao);
-    processarFila(); // Checa se já tem vídeos parados logo ao ligar
-});
+if __name__ == "__main__":
+    main()
