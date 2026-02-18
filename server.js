@@ -50,7 +50,7 @@ function iniciarGravacao(canal) {
     });
 }
 
-// --- 2. LÓGICA DE CORTE (REPLAY) - CORRIGIDA E BLINDADA ---
+// --- 2. LÓGICA DE CORTE (REPLAY) - CORRIGIDA E INSTANTÂNEA ---
 async function processarEvento(camId) {
     const timestamp = Date.now();
     const nomeArquivo = `replay_cam${camId}_${timestamp}.mp4`;
@@ -107,6 +107,9 @@ async function processarEvento(camId) {
         // Limpa a lista de texto após o uso
         if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
 
+        // 👇 A MÁGICA ACONTECE AQUI: Chama o upload imediatamente após o corte!
+        processarFila();
+
     } catch (error) {
         console.error(`❌ [CAM ${camId}] Erro no Corte: ${error.message}`);
         if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
@@ -117,7 +120,7 @@ async function processarEvento(camId) {
 let enviando = false;
 
 async function processarFila() {
-    if (enviando) return; // Evita enviar duas coisas ao mesmo tempo
+    if (enviando) return; // Evita enviar duas coisas ao mesmo tempo ou encavalar uploads
 
     try {
         const arquivos = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.mp4'));
@@ -157,6 +160,7 @@ async function processarFila() {
     }
 }
 
+// Mantém o temporizador de 30 segundos apenas como backup de segurança
 setInterval(processarFila, 30000);
 
 // --- 4. API LOCAL ---
@@ -192,5 +196,5 @@ app.listen(PORTA, () => {
     console.log(`🔥 SERVER TOTEM (Node) | Porta ${PORTA}`);
     console.log(`📹 Config: Segmentos de 45s | Proteção de Internet ATIVADA`);
     CANAIS.forEach(iniciarGravacao);
-    processarFila(); 
+    processarFila(); // Checa se tem vídeo encalhado ao reiniciar
 });
