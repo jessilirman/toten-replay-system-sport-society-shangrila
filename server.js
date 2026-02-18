@@ -8,7 +8,7 @@ const FormData = require('form-data');
 
 // --- CONFIGURAÇÕES ---
 const PORTA = 3000;
-const VPS_URL = 'http://93.127.212.187:3000/api/upload-video'; 
+const VPS_URL = 'https://vcnatela.canchamaciel.com.br/api/upload-video';
 const API_KEY_VPS = 'maciel_secure_upload_key_2024';
 
 const GRAVACAO_DIR = path.join(__dirname, 'buffer_cameras');
@@ -50,7 +50,7 @@ function iniciarGravacao(canal) {
     });
 }
 
-// --- 2. LÓGICA DE CORTE (REPLAY) ---
+// --- 2. LÓGICA DE CORTE (REPLAY) - CORRIGIDA E BLINDADA ---
 async function processarEvento(camId) {
     const timestamp = Date.now();
     const nomeArquivo = `replay_cam${camId}_${timestamp}.mp4`;
@@ -61,46 +61,64 @@ async function processarEvento(camId) {
     console.log(`🎬 [CAM ${camId}] Botão acionado! Gerando replay...`);
 
     try {
-        const arquivos = fs.readdirSync(pastaCam)
-            .filter(f => f.endsWith('.ts'))
-            .map(f => ({ nome: f, caminho: path.join(pastaCam, f), mtime: fs.statSync(path.join(pastaCam, f)).mtimeMs }))
-            .sort((a, b) => b.mtime - a.mtime);
+        const arquivos = fs.readdirSync(pastaCam).filter(f => f.endsWith('.ts'));
 
-        const chunksParaUso = arquivos.slice(0, 3).reverse();
-        if (chunksParaUso.length === 0) throw new Error("Sem gravações disponíveis ainda.");
+        // Trava de segurança: precisa de pelo menos 2 arquivos
+        if (arquivos.length < 2) {
+            console.error(`❌ [CAM ${camId}] Apenas ${arquivos.length} blocos gravados. Preciso de pelo menos 2. Aguarde!`);
+            return; 
+        }
+
+        // Pega os 2 arquivos mais recentes (Garante os últimos ~90 segundos)
+        const chunksParaUso = arquivos
+            .map(f => ({ nome: f, caminho: path.join(pastaCam, f), mtime: fs.statSync(path.join(pastaCam, f)).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime)
+            .slice(0, 2)
+            .reverse();
+
+        console.log(`⏳ [CAM ${camId}] Unindo ${chunksParaUso.length} pedaços...`);
 
         const conteudoLista = chunksParaUso.map(c => `file '${c.caminho}'`).join('\n');
         fs.writeFileSync(listaTxt, conteudoLista);
 
         await new Promise((resolve, reject) => {
+            // Comando FFmpeg limpo: apenas une os blocos sem tentar "fatiar" o tempo
             const cut = spawn('ffmpeg', [
                 '-f', 'concat', '-safe', '0', '-i', listaTxt,
-                '-sseof', '-30',
-                '-t', '30',
-                '-c:v', 'copy',
-                '-c:a', 'aac',
+                '-c', 'copy', 
                 '-y', arquivoFinal
             ]);
-            cut.on('close', code => code === 0 ? resolve() : reject('Erro no corte FFmpeg'));
+
+            cut.on('close', code => {
+                if (code === 0) {
+                    resolve();
+                } else {
+                    reject(new Error(`FFmpeg falhou com código ${code}`));
+                }
+            });
+
+            cut.on('error', (err) => {
+                 reject(new Error(`Erro ao iniciar processo do FFmpeg: ${err.message}`));
+            });
         });
 
         console.log(`✅ [CAM ${camId}] Vídeo criado e adicionado à fila: ${nomeArquivo}`);
-        fs.unlinkSync(listaTxt); 
         
-        // AQUI MUDOU: Não envia para a VPS imediatamente. Apenas salva na pasta.
-        // O sistema de Fila (abaixo) cuidará do envio.
+        // Limpa a lista de texto após o uso
+        if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
 
     } catch (error) {
-        console.error(`❌ [CAM ${camId}] Erro: ${error.message}`);
+        console.error(`❌ [CAM ${camId}] Erro no Corte: ${error.message}`);
+        if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
     }
 }
 
-// --- 3. SISTEMA DE FILA E UPLOAD (PROTEÇÃO CONTRA QUEDA DE INTERNET) ---
+// --- 3. SISTEMA DE FILA E UPLOAD ---
 let enviando = false;
 
 async function processarFila() {
     if (enviando) return; // Evita enviar duas coisas ao mesmo tempo
-    
+
     try {
         const arquivos = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.mp4'));
         if (arquivos.length === 0) return; // Fila vazia
@@ -110,19 +128,16 @@ async function processarFila() {
 
         for (const arquivo of arquivos) {
             const caminhoArquivo = path.join(OUTPUT_DIR, arquivo);
-            
-            // Extrai qual câmera gravou isso com base no nome do arquivo (ex: replay_cam9_123.mp4 -> 9)
             const match = arquivo.match(/cam(\d+)_/);
             const camId = match ? match[1] : '0';
 
             console.log(`☁️ Tentando enviar ${arquivo}...`);
-            
+
             const form = new FormData();
             form.append('video', fs.createReadStream(caminhoArquivo));
             form.append('camId', camId);
             form.append('secret', API_KEY_VPS);
 
-            // Tenta enviar. Se a internet estiver caída, vai dar erro e cair no catch
             const response = await axios.post(VPS_URL, form, {
                 headers: { ...form.getHeaders() },
                 maxContentLength: Infinity,
@@ -130,7 +145,7 @@ async function processarFila() {
             });
 
             console.log(`🚀 Upload Sucesso! VPS respondeu: ${response.data.message}`);
-            
+
             // APAGA do Totem SÓ DEPOIS QUE A VPS CONFIRMAR QUE RECEBEU!
             if (fs.existsSync(caminhoArquivo)) fs.unlinkSync(caminhoArquivo);
         }
@@ -142,14 +157,12 @@ async function processarFila() {
     }
 }
 
-// Inicia o verificador da fila a cada 30 segundos
 setInterval(processarFila, 30000);
-
 
 // --- 4. API LOCAL ---
 const app = express();
 app.use(cors());
-app.use(express.json()); 
+app.use(express.json());
 
 const ultimoClique = {};
 
@@ -167,13 +180,17 @@ app.post('/api/record', (req, res) => {
     }
 
     ultimoClique[cam] = agora;
-    processarEvento(cam);
+    
+    // Responde rapidinho pro Python não travar, e manda processar em background
     res.json({ status: 'Processando localmente e adicionado à fila...' });
+    
+    // Inicia o corte de fato
+    processarEvento(cam);
 });
 
 app.listen(PORTA, () => {
     console.log(`🔥 SERVER TOTEM (Node) | Porta ${PORTA}`);
     console.log(`📹 Config: Segmentos de 45s | Proteção de Internet ATIVADA`);
     CANAIS.forEach(iniciarGravacao);
-    processarFila(); // Checa se já tem vídeos parados logo ao ligar
+    processarFila(); 
 });
