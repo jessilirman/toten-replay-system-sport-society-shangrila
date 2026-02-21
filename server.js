@@ -7,7 +7,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 
 // --- CONFIGURAÇÕES ---
-const PORTA = 3000;
+const PORTA = 3010;
 const VPS_URL = 'https://vcnatela.canchamaciel.com.br/api/upload-video';
 const API_KEY_VPS = 'maciel_secure_upload_key_2024';
 
