@@ -24,33 +24,34 @@ const CANAIS = [9, 13];
 if (!fs.existsSync(GRAVACAO_DIR)) fs.mkdirSync(GRAVACAO_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-// --- 1. LÓGICA DE GRAVAÇÃO (BUFFER OTIMIZADO) ---
+// --- 1. LÓGICA DE GRAVAÇÃO (SEGMENTOS CURTOS PARA MAIOR PRECISÃO) ---
 function iniciarGravacao(canal) {
     const pastaCam = path.join(GRAVACAO_DIR, `cam${canal}`);
     if (!fs.existsSync(pastaCam)) fs.mkdirSync(pastaCam);
 
     const rtspUrl = `rtsp://${DVR.user}:${DVR.pass}@${DVR.ip}:${DVR.porta}/cam/realmonitor?channel=${canal}&subtype=${DVR.subtype}`;
 
-    console.log(`🎥 [CAM ${canal}] Gravando: Blocos de 45s (Mantendo últimos 4)...`);
+    console.log(`🎥 [CAM ${canal}] Gravando: Blocos de 15s (Alta precisão)...`);
+
     const ffmpeg = spawn('ffmpeg', [
         '-rtsp_transport', 'tcp',
         '-i', rtspUrl,
         '-c', 'copy',
         '-f', 'segment',
-        '-segment_time', '45',
-        '-segment_wrap', '4',
+        '-segment_time', '15',      // Reduzido para 15s para capturar o clique mais rápido
+        '-segment_wrap', '12',      // Mantém os últimos 180 segundos no buffer
         '-reset_timestamps', '1',
         '-y', path.join(pastaCam, 'chunk_%03d.ts')
     ]);
 
-    ffmpeg.stderr.on('data', () => {});
+    ffmpeg.stderr.on('data', () => {}); // Silencia logs de debug do ffmpeg
     ffmpeg.on('close', (code) => {
-        console.log(`⚠️ [CAM ${canal}] Caiu (Código ${code}). Reiniciando em 2s...`);
+        console.log(`⚠️ [CAM ${canal}] Conexão perdida (Code ${code}). Reiniciando em 2s...`);
         setTimeout(() => iniciarGravacao(canal), 2000);
     });
 }
 
-// --- 2. LÓGICA DE CORTE (REPLAY) - CORRIGIDA E INSTANTÂNEA ---
+// --- 2. LÓGICA DE REPLAY (CORRIGIDA PARA SINCRONIA) ---
 async function processarEvento(camId) {
     const timestamp = Date.now();
     const nomeArquivo = `replay_cam${camId}_${timestamp}.mp4`;
@@ -58,109 +59,92 @@ async function processarEvento(camId) {
     const arquivoFinal = path.join(OUTPUT_DIR, nomeArquivo);
     const listaTxt = path.join(pastaCam, `list_${timestamp}.txt`);
 
-    console.log(`🎬 [CAM ${camId}] Botão acionado! Gerando replay...`);
+    console.log(`🎬 [CAM ${camId}] Botão acionado! Aguardando 4s para fechar o bloco atual...`);
 
     try {
+        // ESSENCIAL: Aguarda o bloco atual ser escrito no disco para não perder o final do vídeo
+        await new Promise(resolve => setTimeout(resolve, 4000));
+
         const arquivos = fs.readdirSync(pastaCam).filter(f => f.endsWith('.ts'));
 
-        // Trava de segurança: precisa de pelo menos 2 arquivos
-        if (arquivos.length < 2) {
-            console.error(`❌ [CAM ${camId}] Apenas ${arquivos.length} blocos gravados. Preciso de pelo menos 2. Aguarde!`);
-            return; 
+        if (arquivos.length < 3) {
+            console.error(`❌ [CAM ${camId}] Buffer insuficiente (${arquivos.length} blocos).`);
+            return;
         }
 
-        // Pega os 2 arquivos mais recentes (Garante os últimos ~90 segundos)
+        // Pega os 4 blocos mais recentes (Aprox. 60 segundos de vídeo)
         const chunksParaUso = arquivos
-            .map(f => ({ nome: f, caminho: path.join(pastaCam, f), mtime: fs.statSync(path.join(pastaCam, f)).mtimeMs }))
+            .map(f => ({
+                nome: f,
+                caminho: path.join(pastaCam, f),
+                mtime: fs.statSync(path.join(pastaCam, f)).mtimeMs
+            }))
             .sort((a, b) => b.mtime - a.mtime)
-            .slice(0, 2)
+            .slice(0, 4)
             .reverse();
 
-        console.log(`⏳ [CAM ${camId}] Unindo ${chunksParaUso.length} pedaços...`);
+        console.log(`⏳ [CAM ${camId}] Unindo blocos para replay sincronizado...`);
 
         const conteudoLista = chunksParaUso.map(c => `file '${c.caminho}'`).join('\n');
         fs.writeFileSync(listaTxt, conteudoLista);
 
         await new Promise((resolve, reject) => {
-            // Comando FFmpeg limpo: apenas une os blocos sem tentar "fatiar" o tempo
             const cut = spawn('ffmpeg', [
                 '-f', 'concat', '-safe', '0', '-i', listaTxt,
-                '-c', 'copy', 
+                '-c', 'copy',
                 '-y', arquivoFinal
             ]);
 
-            cut.on('close', code => {
-                if (code === 0) {
-                    resolve();
-                } else {
-                    reject(new Error(`FFmpeg falhou com código ${code}`));
-                }
-            });
-
-            cut.on('error', (err) => {
-                 reject(new Error(`Erro ao iniciar processo do FFmpeg: ${err.message}`));
-            });
+            cut.on('close', code => code === 0 ? resolve() : reject(new Error(`Erro no concat`)));
         });
 
-        console.log(`✅ [CAM ${camId}] Vídeo criado e adicionado à fila: ${nomeArquivo}`);
-        
-        // Limpa a lista de texto após o uso
+        console.log(`✅ [CAM ${camId}] Replay gerado com sucesso!`);
         if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
 
-        // 👇 A MÁGICA ACONTECE AQUI: Chama o upload imediatamente após o corte!
         processarFila();
 
     } catch (error) {
-        console.error(`❌ [CAM ${camId}] Erro no Corte: ${error.message}`);
+        console.error(`❌ [CAM ${camId}] Erro no processamento: ${error.message}`);
         if (fs.existsSync(listaTxt)) fs.unlinkSync(listaTxt);
     }
 }
 
-// --- 3. SISTEMA DE FILA E UPLOAD ---
+// --- 3. SISTEMA DE FILA E UPLOAD (SEM ALTERAÇÕES) ---
 let enviando = false;
-
 async function processarFila() {
-    if (enviando) return; // Evita enviar duas coisas ao mesmo tempo ou encavalar uploads
+    if (enviando) return;
 
     try {
         const arquivos = fs.readdirSync(OUTPUT_DIR).filter(f => f.endsWith('.mp4'));
-        if (arquivos.length === 0) return; // Fila vazia
+        if (arquivos.length === 0) return;
 
         enviando = true;
-        console.log(`🔄 Fila de Upload: ${arquivos.length} vídeo(s) aguardando...`);
-
         for (const arquivo of arquivos) {
             const caminhoArquivo = path.join(OUTPUT_DIR, arquivo);
             const match = arquivo.match(/cam(\d+)_/);
             const camId = match ? match[1] : '0';
-
-            console.log(`☁️ Tentando enviar ${arquivo}...`);
 
             const form = new FormData();
             form.append('video', fs.createReadStream(caminhoArquivo));
             form.append('camId', camId);
             form.append('secret', API_KEY_VPS);
 
-            const response = await axios.post(VPS_URL, form, {
+            await axios.post(VPS_URL, form, {
                 headers: { ...form.getHeaders() },
                 maxContentLength: Infinity,
                 maxBodyLength: Infinity
             });
 
-            console.log(`🚀 Upload Sucesso! VPS respondeu: ${response.data.message}`);
-
-            // APAGA do Totem SÓ DEPOIS QUE A VPS CONFIRMAR QUE RECEBEU!
+            console.log(`🚀 [UPLOAD] ${arquivo} enviado com sucesso!`);
             if (fs.existsSync(caminhoArquivo)) fs.unlinkSync(caminhoArquivo);
         }
     } catch (error) {
-        console.error(`❌ Falha no Upload (Sem internet?): ${error.message}`);
-        console.log("⏳ O vídeo continuará na fila e o sistema tentará novamente em 30 segundos.");
+        console.error(`❌ [UPLOAD] Falha: ${error.message}`);
     } finally {
         enviando = false;
     }
 }
 
-// Mantém o temporizador de 30 segundos apenas como backup de segurança
 setInterval(processarFila, 30000);
 
 // --- 4. API LOCAL ---
@@ -171,30 +155,21 @@ app.use(express.json());
 const ultimoClique = {};
 
 app.post('/api/record', (req, res) => {
-    if (!req.body || !req.body.cam) {
-        return res.status(400).json({ error: 'Parâmetro "cam" obrigatório' });
-    }
-
     const { cam } = req.body;
-    const agora = Date.now();
+    if (!cam) return res.status(400).json({ error: 'Falta parâmetro cam' });
 
+    const agora = Date.now();
     if (ultimoClique[cam] && (agora - ultimoClique[cam] < 15000)) {
-        console.log(`🛡️ [CAM ${cam}] Spam bloqueado.`);
-        return res.status(429).json({ error: 'Aguarde...' });
+        return res.status(429).json({ error: 'Spam bloqueado' });
     }
 
     ultimoClique[cam] = agora;
-    
-    // Responde rapidinho pro Python não travar, e manda processar em background
-    res.json({ status: 'Processando localmente e adicionado à fila...' });
-    
-    // Inicia o corte de fato
+    res.json({ status: 'Solicitação recebida, processando replay...' });
+
     processarEvento(cam);
 });
 
 app.listen(PORTA, () => {
-    console.log(`🔥 SERVER TOTEM (Node) | Porta ${PORTA}`);
-    console.log(`📹 Config: Segmentos de 45s | Proteção de Internet ATIVADA`);
+    console.log(`🔥 TOTEM ATIVO NA PORTA ${PORTA}`);
     CANAIS.forEach(iniciarGravacao);
-    processarFila(); // Checa se tem vídeo encalhado ao reiniciar
 });
